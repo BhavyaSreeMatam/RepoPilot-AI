@@ -1,0 +1,39 @@
+# Environment variables
+backend/.env
+.env
+
+# Python virtual environments
+backend/venv/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backend generated data
+backend/uploads/
+backend/extracted_repos/
+backend/indexes/
+backend/chroma/
+backend/vector_store/
+backend/.chroma/
+
+# Frontend dependencies/build
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+*.log
+logs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
