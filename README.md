@@ -116,3 +116,25 @@ http://localhost:5173
 6. Generate onboarding summaries.
 7. Use the debug assistant for repository-specific issues.
 8. Review retrieved sources, agent steps, and verifier notes.
+
+## Screenshots
+
+### Repository Dashboard
+
+![Repository Dashboard](docs/screenshots/Homepage.png)
+
+### Indexed Repository
+
+![Indexed Repository](docs/screenshots/Indexed.png)
+
+### Agent Answer
+
+![Agent Answer](docs/screenshots/Agent_answer.png)
+
+### Sources and Agent Steps
+
+![Sources and Verifier](docs/screenshots/Sources&agentsteps.png)
+
+### Verifier 
+
+![Debug Assistant](docs/screenshots/verifier.png)
