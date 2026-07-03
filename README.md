@@ -22,8 +22,9 @@ The system allows users to upload a repository as a ZIP file, index the codebase
 - FastAPI
 - Python
 - OpenAI API
-- Local vector store
-- Multi-agent workflow for routing, retrieval, answering, debugging, summarization, and verification
+- Local vector store (ChromaDB)
+- LangGraph multi-agent workflow for routing, retrieval, answering, debugging, summarization, and verification
+- MCP (Model Context Protocol) — the orchestrator communicates with the specialized agents as MCP tools over stdio
 
 ### Frontend
 - React
@@ -53,6 +54,61 @@ RepoPilot-AI/
 │   ├── package.json
 │   └── vite.config.js
 └── README.md
+```
+
+## Architecture
+
+The orchestrator (router) communicates with the five specialized agents through **MCP (Model Context Protocol)**. The router, retriever, and verifier run as in-process LangGraph nodes; the specialized agents run in a separate MCP server subprocess and are invoked as MCP tools over stdio. The subprocess is spawned once at FastAPI startup (via the `lifespan` handler) and reused across requests.
+
+```mermaid
+flowchart TB
+    subgraph Client["Frontend (React / Vite)"]
+        UI["Dashboard UI<br/>api.js"]
+    end
+
+    subgraph Backend["FastAPI Backend Process"]
+        direction TB
+        EP["/agent/ask · /agent/summarize · /agent/debug<br/>(async → ainvoke)"]
+
+        subgraph Graph["LangGraph StateGraph (in-process)"]
+            direction TB
+            R["router_agent<br/>picks route via LLM"]
+            RET["retriever_agent<br/>ChromaDB vector search"]
+            SPEC["specialized_agent_node<br/>ROUTE_TO_TOOL lookup<br/>+ MCP call_tool"]
+            VER["verifier_agent<br/>grounding check"]
+            R --> RET --> SPEC --> VER
+        end
+
+        MC["mcp_client.py<br/>persistent ClientSession<br/>(AsyncExitStack, stdio)"]
+
+        EP --> R
+        VER --> EP
+        SPEC -->|"await session.call_tool()"| MC
+    end
+
+    subgraph MCPServer["MCP Server Subprocess (stdio)"]
+        direction TB
+        FM["FastMCP<br/>'repopilot-specialized-agents'"]
+        subgraph Tools["@mcp.tool()"]
+            T1["architecture_agent"]
+            T2["bug_agent"]
+            T3["security_agent"]
+            T4["docs_agent"]
+            T5["general_agent"]
+        end
+        FM --> Tools
+        LLM["run_llm_agent()<br/>llm_utils.py"]
+        Tools --> LLM
+    end
+
+    OpenAI["OpenAI API<br/>gpt-4.1-mini"]
+
+    UI -->|HTTP| EP
+    MC <==>|"MCP over stdio<br/>(spawned at lifespan startup,<br/>env=os.environ.copy())"| FM
+    R -.->|LLM call| OpenAI
+    VER -.->|LLM call| OpenAI
+    LLM -->|LLM call| OpenAI
+    RET -.->|embeddings| OpenAI
 ```
 
 ## Setup Instructions

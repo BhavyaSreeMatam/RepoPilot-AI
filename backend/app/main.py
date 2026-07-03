@@ -1,6 +1,9 @@
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True so backend/.env is the single source of truth even if a stale
+# OPENAI_API_KEY is already present in the OS/shell environment.
+load_dotenv(override=True)
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.repo_routes import router as repo_router
@@ -8,11 +11,23 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from app.agents.graph import repopilot_graph
+from app.agents.mcp_client import get_mcp_session, close_mcp_session
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Spawn the specialized-agents MCP server subprocess once at boot.
+    # Fails fast if the subprocess cannot start or initialize.
+    await get_mcp_session()
+    yield
+    await close_mcp_session()
+
 
 app = FastAPI(
     title="RepoPilot AI",
     description="An AI Engineering Copilot for Codebase Understanding, Debugging, and Developer Onboarding",
     version="0.1.0",
+    lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -93,7 +108,7 @@ def build_sources_from_contexts(contexts: List[Dict[str, Any]]) -> List[Dict[str
     return sources
 
 @app.post("/agent/ask", response_model=AgentAskResponse)
-def agent_ask(request: AgentAskRequest):
+async def agent_ask(request: AgentAskRequest):
     """
     LangGraph-powered multi-agent ask endpoint.
     """
@@ -109,7 +124,7 @@ def agent_ask(request: AgentAskRequest):
         "steps": [],
     }
 
-    result = repopilot_graph.invoke(initial_state)
+    result = await repopilot_graph.ainvoke(initial_state)
 
     contexts = result.get("contexts", [])
     sources = build_sources_from_contexts(contexts)
@@ -126,7 +141,7 @@ def agent_ask(request: AgentAskRequest):
         }
 
 @app.post("/agent/summarize", response_model=AgentAskResponse)
-def agent_summarize(request: AgentSummarizeRequest):
+async def agent_summarize(request: AgentSummarizeRequest):
     """
     Generate a developer onboarding summary for a repository.
     """
@@ -158,7 +173,7 @@ Mention relevant file paths.
         "steps": [],
     }
 
-    result = repopilot_graph.invoke(initial_state)
+    result = await repopilot_graph.ainvoke(initial_state)
 
     contexts = result.get("contexts", [])
     sources = build_sources_from_contexts(contexts)
@@ -175,7 +190,7 @@ Mention relevant file paths.
     }
 
 @app.post("/agent/debug", response_model=AgentAskResponse)
-def agent_debug(request: AgentDebugRequest):
+async def agent_debug(request: AgentDebugRequest):
     """
     Diagnose a repository bug/error using the multi-agent pipeline.
     """
@@ -212,7 +227,7 @@ Mention relevant file paths and line ranges when possible.
         "steps": [],
     }
 
-    result = repopilot_graph.invoke(initial_state)
+    result = await repopilot_graph.ainvoke(initial_state)
 
     contexts = result.get("contexts", [])
     sources = build_sources_from_contexts(contexts)
