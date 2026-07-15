@@ -1,0 +1,26 @@
+# Local dev / build artifacts that must never go into the image
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Runtime-generated data (rebuilt per deployment, not shipped)
+uploads/
+extracted_repos/
+vector_store/
+indexes/
+chroma/
+.chroma/
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db
