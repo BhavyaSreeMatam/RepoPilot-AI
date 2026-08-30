@@ -9,7 +9,13 @@ class RepoPilotState(TypedDict):
     repo_id: str
     question: str
     route: Optional[str]
+
     contexts: List[Dict[str, Any]]
+
+    # Repository-wide deterministic security scan results.
+    security_findings: List[Dict[str, Any]]
+    security_scan_summary: Optional[Dict[str, Any]]
+
     answer: Optional[str]
     verified: Optional[bool]
     verifier_notes: Optional[str]

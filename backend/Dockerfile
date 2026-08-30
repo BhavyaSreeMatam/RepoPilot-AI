@@ -1,5 +1,6 @@
 # Backend image for RepoPilot AI (FastAPI + LangGraph + MCP server subprocess).
-# The MCP server is spawned in-process by the app at startup via
+# The MCP server is spawned as a subprocess by the app at startup via
+# `sys.executable -m app.mcp_server.server`, so no separate container is needed.
 # `sys.executable -m app.mcp_server.server`, so no separate container is needed.
 FROM python:3.14-slim
 

@@ -37,3 +37,9 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local Docker runtime data
+docker-data/
+
+# Local test repositories
+sampleproject.zip

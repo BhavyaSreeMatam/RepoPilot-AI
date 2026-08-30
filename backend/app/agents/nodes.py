@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+from pathlib import Path
 
 from openai import OpenAI
 
@@ -6,6 +7,7 @@ from app.agents.state import RepoPilotState
 from app.agents.llm_utils import build_context_text, run_llm_agent
 from app.agents.mcp_client import get_mcp_session
 from app.services.vector_service import search_repository
+from app.services.security_scanner import scan_security_repository
 
 
 # Maps the router's route values to the corresponding MCP tool names.
@@ -121,6 +123,121 @@ def retriever_agent(state: RepoPilotState) -> Dict[str, Any]:
         "contexts": matches,
         "steps": state.get("steps", []) + [
             f"retriever_agent found {len(matches)} chunks using top_k={top_k}"
+        ],
+    }
+
+
+def security_scan_node(state: RepoPilotState) -> Dict[str, Any]:
+    """
+    Runs a repository-wide deterministic security scan only when the router
+    selected the security route.
+
+    Findings are stored in structured form and also converted into additional
+    contexts so the existing MCP security_agent and verifier can reason over
+    them without changing the MCP tool interface.
+    """
+
+    route = state.get("route", "general_rag")
+
+    if route != "security":
+        return {
+            "security_findings": [],
+            "security_scan_summary": None,
+            "steps": state.get("steps", []) + [
+                "security_scan_node skipped because route was not security"
+            ],
+        }
+
+    repo_id = state["repo_id"]
+
+    # nodes.py is backend/app/agents/nodes.py
+    # parents[2] resolves to backend/
+    backend_root = Path(__file__).resolve().parents[2]
+    repo_path = backend_root / "extracted_repos" / repo_id
+
+    try:
+        scan_result = scan_security_repository(repo_path)
+
+    except Exception as exc:
+        return {
+            "security_findings": [],
+            "security_scan_summary": {
+                "status": "failed",
+                "error": str(exc),
+            },
+            "steps": state.get("steps", []) + [
+                f"security_scan_node failed: {exc}"
+            ],
+        }
+
+    findings = scan_result.get("findings", [])
+
+    security_scan_summary = {
+        "files_scanned": scan_result.get("files_scanned", 0),
+        "files_skipped": scan_result.get("files_skipped", 0),
+        "findings_count": scan_result.get("findings_count", 0),
+        "severity_counts": scan_result.get("severity_counts", {}),
+    }
+
+    # Keep the highest-severity findings first so we do not send an enormous
+    # repository scan into the LLM if a repository contains many findings.
+    severity_rank = {
+        "CRITICAL": 0,
+        "HIGH": 1,
+        "MEDIUM": 2,
+        "LOW": 3,
+        "INFO": 4,
+    }
+
+    sorted_findings = sorted(
+        findings,
+        key=lambda item: severity_rank.get(item.get("severity", "INFO"), 99),
+    )
+
+    findings_for_context = sorted_findings[:25]
+
+    security_contexts = []
+
+    for finding in findings_for_context:
+        content = f"""
+Repository-wide static security scan finding.
+
+Rule ID: {finding.get("rule_id")}
+Severity: {finding.get("severity")}
+Category: {finding.get("category")}
+File: {finding.get("file_path")}
+Lines: {finding.get("start_line")}-{finding.get("end_line")}
+Finding: {finding.get("message")}
+Evidence: {finding.get("evidence")}
+
+This finding came from RepoPilot's deterministic read-only security scanner.
+Treat it as scanner evidence, but explain actual exploitability carefully and
+do not exaggerate the risk without supporting repository context.
+""".strip()
+
+        security_contexts.append(
+            {
+                "file_path": finding.get("file_path", "unknown"),
+                "language": "Security Scan",
+                "start_line": finding.get("start_line"),
+                "end_line": finding.get("end_line"),
+                "similarity_distance": None,
+                "content": content,
+            }
+        )
+
+    combined_contexts = state.get("contexts", []) + security_contexts
+
+    return {
+        "contexts": combined_contexts,
+        "security_findings": findings,
+        "security_scan_summary": security_scan_summary,
+        "steps": state.get("steps", []) + [
+            (
+                "security_scan_node scanned "
+                f"{security_scan_summary['files_scanned']} files and found "
+                f"{security_scan_summary['findings_count']} potential findings"
+            )
         ],
     }
 

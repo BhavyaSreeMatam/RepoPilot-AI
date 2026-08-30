@@ -71,6 +71,22 @@ class SourceItem(BaseModel):
     end_line: Optional[int] = None
     similarity_distance: Optional[float] = None
 
+class SecurityFinding(BaseModel):
+    rule_id: str
+    severity: str
+    category: str
+    file_path: str
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    evidence: Optional[str] = None
+    message: str
+
+
+class SecurityScanSummary(BaseModel):
+    files_scanned: int = 0
+    files_skipped: int = 0
+    findings_count: int = 0
+    severity_counts: Dict[str, int] = {}
 
 class AgentAskResponse(BaseModel):
     repo_id: str
@@ -81,6 +97,8 @@ class AgentAskResponse(BaseModel):
     verifier_notes: Optional[str] = None
     sources: List[SourceItem]
     steps: List[str]
+    security_findings: List[SecurityFinding] = []
+    security_scan_summary: Optional[SecurityScanSummary] = None
 
 class AgentDebugRequest(BaseModel):
     repo_id: str
@@ -118,6 +136,8 @@ async def agent_ask(request: AgentAskRequest):
         "question": request.question,
         "route": None,
         "contexts": [],
+        "security_findings": [],
+        "security_scan_summary": None,
         "answer": None,
         "verified": None,
         "verifier_notes": None,
@@ -138,6 +158,8 @@ async def agent_ask(request: AgentAskRequest):
             "verifier_notes": result.get("verifier_notes"),
             "sources": sources,
             "steps": result.get("steps", []),
+            "security_findings": result.get("security_findings", []),
+            "security_scan_summary": result.get("security_scan_summary"),
         }
 
 @app.post("/agent/summarize", response_model=AgentAskResponse)
@@ -167,6 +189,8 @@ Mention relevant file paths.
         "question": summary_question,
         "route": "architecture",
         "contexts": [],
+        "security_findings": [],
+        "security_scan_summary": None,
         "answer": None,
         "verified": None,
         "verifier_notes": None,
@@ -187,6 +211,8 @@ Mention relevant file paths.
         "verifier_notes": result.get("verifier_notes"),
         "sources": sources,
         "steps": result.get("steps", []),
+        "security_findings": result.get("security_findings", []),
+        "security_scan_summary": result.get("security_scan_summary"),
     }
 
 @app.post("/agent/debug", response_model=AgentAskResponse)
@@ -221,6 +247,8 @@ Mention relevant file paths and line ranges when possible.
         "question": debug_question,
         "route": None,
         "contexts": [],
+        "security_findings": [],
+        "security_scan_summary": None,
         "answer": None,
         "verified": None,
         "verifier_notes": None,
@@ -241,4 +269,6 @@ Mention relevant file paths and line ranges when possible.
         "verifier_notes": result.get("verifier_notes"),
         "sources": sources,
         "steps": result.get("steps", []),
+        "security_findings": result.get("security_findings", []),
+        "security_scan_summary": result.get("security_scan_summary"),
     }

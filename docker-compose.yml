@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: ./backend
+
+    image: repopilot-backend
+
+    env_file:
+      - ./backend/.env
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - ./docker-data/uploads:/app/uploads
+      - ./docker-data/extracted_repos:/app/extracted_repos
+      - ./docker-data/vector_store:/app/vector_store
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /api
+
+    image: repopilot-frontend
+
+    ports:
+      - "80:80"
+
+    depends_on:
+      backend:
+        condition: service_healthy

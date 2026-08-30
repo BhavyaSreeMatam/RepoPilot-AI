@@ -1,4 +1,4 @@
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
 async function handleResponse(response, fallbackMessage) {
   const responseText = await response.text();
@@ -86,4 +86,28 @@ export async function debugIssue(repoId, issue) {
   });
 
   return handleResponse(response, "Failed to debug issue");
+}
+
+export async function securityReview(repoId) {
+  const response = await fetch(`${API_BASE_URL}/agent/ask`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      repo_id: repoId,
+      question:
+        "Perform a security review of this repository. Check for unsafe deserialization, command execution, secrets, insecure configuration, cryptographic weaknesses, unsafe file handling, CI/CD risks, Docker risks, and other security issues.",
+    }),
+  });
+
+  return handleResponse(response, "Failed to run security review");
+}
+
+export async function listRepos() {
+  const response = await fetch(`${API_BASE_URL}/repos`, {
+    method: "GET",
+  });
+
+  return handleResponse(response, "Failed to load repositories");
 }

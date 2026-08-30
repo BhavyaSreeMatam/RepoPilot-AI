@@ -1,4 +1,4 @@
-import { uploadRepo, scanRepo, indexRepo, askAgent,generateSummary,debugIssue} from "./api";
+import { uploadRepo, scanRepo, indexRepo, askAgent,generateSummary,debugIssue,securityReview,listRepos,} from "./api";
 import { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import "./App.css";
@@ -21,9 +21,24 @@ function App() {
   const [activeSection, setActiveSection] = useState("repositories");
   const [mode, setMode] = useState("ask");
 
+  const [repositories, setRepositories] = useState([]);
+
   useEffect(() => {
   setQuestion("");
 }, [mode]);
+
+useEffect(() => {
+  async function loadRepositories() {
+    try {
+      const data = await listRepos();
+      setRepositories(data.repositories || []);
+    } catch (err) {
+      console.error("LOAD REPOSITORIES ERROR:", err);
+    }
+  }
+
+  loadRepositories();
+}, []);
 
   const placeholderText = {
     ask: "Example: Explain how this repository is organized and how the main components interact.",
@@ -41,7 +56,7 @@ function App() {
 
 
     try {
-      setLoadingAction(true);
+      setLoadingAction("upload");
       setError("");
 
       const data = await uploadRepo(selectedFile);
@@ -57,11 +72,37 @@ function App() {
       setActiveSection("repositories");
     } catch (err) {
       console.error("Full upload error: " + err);
-      setError(err.message || string(err));
+      setError(err.message || String(err));
     } finally {
       setLoadingAction("");
     }
   }
+
+  function handleSelectRepository(repository) {
+  setRepoId(repository.repo_id);
+
+  // This repository came from the persisted backend list,
+  // not from a fresh upload in this browser session.
+  setUploadResult(null);
+
+  // GET /repos tells us whether this repository is indexed.
+  // This allows Ask / Onboarding / Debug / Security buttons to work
+  // for repositories restored after a restart.
+  if (repository.indexed) {
+    setIndexResult({
+      message: "Existing repository index is available.",
+      existing: true,
+    });
+  } else {
+    setIndexResult(null);
+  }
+
+  setAnswer(null);
+  setQuestion("");
+  setError("");
+  setActiveSection("repositories");
+}
+
   async function handleIndex() {
     if (!repoId) {
       setError("Please upload a repository first.");
@@ -175,6 +216,36 @@ function App() {
       setLoadingAction("");
     }
   }
+
+  async function handleSecurityReview() {
+  if (!repoId) {
+    setError("Please upload a repository first.");
+    return;
+  }
+
+  if (!indexResult) {
+    setError("Please index the repository before running a security review.");
+    return;
+  }
+
+  try {
+    setLoadingAction("security");
+    setError("");
+
+    const data = await securityReview(repoId);
+
+    setAnswer(data);
+    setMode("security");
+    setActiveSection("security");
+  } catch (err) {
+    console.error("SECURITY REVIEW ERROR:", err);
+    setError(err.message || String(err));
+  } finally {
+    setLoadingAction("");
+  }
+}
+
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -229,6 +300,20 @@ function App() {
   >
     Debug Assistant
   </button>
+
+  <button
+    className={`nav-item ${activeSection === "security" ? "active" : ""}`}
+    onClick={() => {
+      setActiveSection("security");
+      setMode("security");
+      setQuestion("");
+    }}
+  >
+    Security Review
+  </button>
+
+
+
 </nav>
 
         <div className="sidebar-footer">
@@ -303,58 +388,109 @@ function App() {
                 </div>
               </div>
 
-              {uploadResult ? (
-                <div className="repo-empty">
-                  <strong>Repository uploaded successfully</strong>
-
-                  <span>
-                    Repo ID: {uploadResult.repo_id}
-                  </span>
-
-                  <span>
-                    Total files found: {uploadResult.total_files_found}
-                  </span>
-
-                  <span>
-                    Code files found: {uploadResult.code_files_found}
-                  </span>
-
-                  <span>
-                    Ignored files: {uploadResult.ignored_files}
-                  </span>
-
-                   <button
-                      className="primary-button"
-                      onClick={handleIndex}
-                      disabled={loadingAction !== "" || !repoId}
+              {repositories.length > 0 ? (
+                <div className="repository-list">
+                  {repositories.map((repository) => (
+                    <button
+                      key={repository.repo_id}
+                      type="button"
+                      className={`repository-list-item ${
+                        repoId === repository.repo_id ? "selected" : ""
+                      }`}
+                      onClick={() => handleSelectRepository(repository)}
                     >
-                      {loadingAction === "index" ? "Indexing..." : "Index Repository"}
+                      <div className="repository-list-main">
+                        <strong>
+                          {repository.repo_name ||
+                            repository.original_filename ||
+                            "Repository"}
+                        </strong>
+
+                        <span>{repository.original_filename}</span>
+                      </div>
+
+                      <div className="repository-list-meta">
+                        <span className="repository-id">
+                          {repository.repo_id}
+                        </span>
+
+                        <span
+                          className={`repository-index-status ${
+                            repository.indexed ? "indexed" : "not-indexed"
+                          }`}
+                        >
+                          {repository.indexed ? "Indexed" : "Not Indexed"}
+                        </span>
+                      </div>
                     </button>
-
-                    {indexResult && (
-                      <>
-                        <strong>Index created successfully</strong>
-
-                        <span>
-                          {indexResult.message}
-                        </span>
-
-                        <span>
-                          Files used for indexing: {indexResult.total_files_used}
-                        </span>
-
-                        <span>
-                          Chunks indexed: {indexResult.indexed_chunks}
-                        </span>
-                      </>
-                    )}
+                  ))}
                 </div>
               ) : (
                 <div className="repo-empty">
                   <strong>No repositories loaded</strong>
-                  <span>
-                    Upload a ZIP repository to begin.
-                  </span>
+                  <span>Upload a ZIP repository to begin.</span>
+                </div>
+              )}
+
+              {repoId && (
+                <div className="selected-repository-panel">
+                  <strong>Selected Repository</strong>
+
+                  <span>Repo ID: {repoId}</span>
+
+                  {uploadResult && (
+                    <>
+                      <span>
+                        Total files found: {uploadResult.total_files_found}
+                      </span>
+
+                      <span>
+                        Code files found: {uploadResult.code_files_found}
+                      </span>
+
+                      <span>
+                        Ignored files: {uploadResult.ignored_files}
+                      </span>
+                    </>
+                  )}
+
+                  {indexResult?.existing ? (
+                    <div className="existing-index-message">
+                      Existing repository index is available.
+                    </div>
+                  ) : (
+                    <button
+                      className="primary-button"
+                      onClick={handleIndex}
+                      disabled={loadingAction !== "" || !repoId}
+                    >
+                      {loadingAction === "index"
+                        ? "Indexing..."
+                        : indexResult
+                        ? "Re-index Repository"
+                        : "Index Repository"}
+                    </button>
+                  )}
+
+                  {indexResult && !indexResult.existing && (
+                    <div className="index-result-summary">
+                      <strong>Index created successfully</strong>
+
+                      <span>{indexResult.message}</span>
+
+                      {indexResult.total_files_used !== undefined && (
+                        <span>
+                          Files used for indexing: {indexResult.total_files_used}
+                        </span>
+                      )}
+
+                      {indexResult.indexed_chunks !== undefined && (
+                        <span>
+                          Chunks indexed: {indexResult.indexed_chunks}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -368,6 +504,7 @@ function App() {
                     {mode === "ask" && "Ask RepoPilot"}
                     {mode === "onboarding" && "Onboarding Summary"}
                     {mode === "debug" && "Debug Assistant"}
+                    {mode === "security" && "Security Review"}
                   </h3>
 
                   <p>
@@ -377,6 +514,8 @@ function App() {
                       "Generate a structured developer onboarding summary."}
                     {mode === "debug" &&
                       "Describe an error or failure and get debugging guidance."}
+                    {mode === "security" &&
+                      "Run a repository-wide security scan and AI-assisted security analysis."}
                   </p>
                 </div>
               </div>
@@ -402,15 +541,47 @@ function App() {
                 >
                   Debug
                 </button>
+
+                <button
+                  className={mode === "security" ? "mode-tab active" : "mode-tab"}
+                  onClick={() => {
+                    setMode("security");
+                    setActiveSection("security");
+                    setQuestion("");
+                  }}
+                >
+                  Security
+                </button>
               </div>
 
-              <textarea
-                className="question-input"
-                rows="7"
-                value={question}
-                onChange={(event) => setQuestion(event.target.value)}
-                placeholder={placeholderText[mode]}
-              />
+              {mode !== "security" ? (
+                <textarea
+                  className="question-input"
+                  rows="7"
+                  value={question}
+                  onChange={(event) => setQuestion(event.target.value)}
+                  placeholder={placeholderText[mode]}
+                />
+              ) : (
+                <div className="security-intro">
+                  <strong>Repository Security Review</strong>
+
+                  <p>
+                    RepoPilot will scan the repository for security-sensitive patterns
+                    and combine those findings with retrieved code context for analysis
+                    by the MCP Security Agent.
+                  </p>
+
+                  <div className="security-check-list">
+                    <span>Unsafe deserialization</span>
+                    <span>Secrets and credentials</span>
+                    <span>Command execution</span>
+                    <span>Insecure configuration</span>
+                    <span>Cryptographic weaknesses</span>
+                    <span>Docker and CI/CD risks</span>
+                  </div>
+                </div>
+              )}
 
               <div className="button-row">
                 {mode === "ask" && (
@@ -443,15 +614,30 @@ function App() {
                   </button>
                 )}
 
-                <button
-                  className="secondary-button"
-                  onClick={() => setQuestion("")}
-                >
-                  Clear
-                </button>
+                {mode === "security" && (
+                  <button
+                    className="primary-button"
+                    onClick={handleSecurityReview}
+                    disabled={loadingAction !== "" || !repoId || !indexResult}
+                  >
+                    {loadingAction === "security"
+                      ? "Scanning Repository..."
+                      : "Run Security Review"}
+                  </button>
+                )}
+
+                {mode !== "security" && (
+                  <button
+                    className="secondary-button"
+                    onClick={() => setQuestion("")}
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
 
-            <div className="card answer-card">
+            {mode !== "security" && (
+              <div className="card answer-card">
               <div className="answer-top">
                 <div>
                   <h3>Agent Answer</h3>
@@ -480,6 +666,8 @@ function App() {
                       ? "Issue"
                       : answer.route === "onboarding" || answer.route === "summary"
                       ? "Summary Request"
+                      : answer.route === "security"
+                      ? "Security Review Request"
                       : "Question"}
                   </h4>
 
@@ -492,6 +680,8 @@ function App() {
                       ? "Debug Guidance"
                       : answer.route === "onboarding" || answer.route === "summary"
                       ? "Onboarding Summary"
+                      : answer.route === "security"
+                      ? "Security Analysis"
                       : "Answer"}
                   </h4>
 
@@ -510,7 +700,190 @@ function App() {
                 </div>
               )}
             </div>
+            )}
           </section>
+
+          {mode === "security" && (
+            <section className="security-dashboard">
+              <div className="security-dashboard-header">
+                <div>
+                  <p className="eyebrow">Repository Security</p>
+                  <h3>Security Scan Results</h3>
+                  <p>
+                    Deterministic repository scanning combined with MCP-based
+                    AI security analysis.
+                  </p>
+                </div>
+
+                {answer?.route === "security" && (
+                  <span
+                    className={`security-status ${
+                      answer.verified ? "verified" : "review"
+                    }`}
+                  >
+                    {answer.verified ? "Verified" : "Needs Review"}
+                  </span>
+                )}
+              </div>
+
+              {answer?.route === "security" &&
+              answer?.security_scan_summary ? (
+                <>
+                  <div className="security-stats">
+                    <div className="security-stat-card">
+                      <span>Files Scanned</span>
+                      <strong>
+                        {answer.security_scan_summary.files_scanned ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card">
+                      <span>Files Skipped</span>
+                      <strong>
+                        {answer.security_scan_summary.files_skipped ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card">
+                      <span>Total Findings</span>
+                      <strong>
+                        {answer.security_scan_summary.findings_count ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card critical">
+                      <span>Critical</span>
+                      <strong>
+                        {answer.security_scan_summary.severity_counts?.CRITICAL ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card high">
+                      <span>High</span>
+                      <strong>
+                        {answer.security_scan_summary.severity_counts?.HIGH ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card medium">
+                      <span>Medium</span>
+                      <strong>
+                        {answer.security_scan_summary.severity_counts?.MEDIUM ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card low">
+                      <span>Low</span>
+                      <strong>
+                        {answer.security_scan_summary.severity_counts?.LOW ?? 0}
+                      </strong>
+                    </div>
+
+                    <div className="security-stat-card info">
+                      <span>Info</span>
+                      <strong>
+                        {answer.security_scan_summary.severity_counts?.INFO ?? 0}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div className="security-findings-card">
+                    <div className="security-findings-header">
+                      <div>
+                        <h3>Security Findings</h3>
+                        <p>
+                          Potential security-sensitive patterns detected across
+                          the repository.
+                        </p>
+                      </div>
+                    </div>
+
+                    {answer.security_findings?.length > 0 ? (
+                      <div className="security-findings-list">
+                        {answer.security_findings.map((finding, index) => (
+                          <div
+                            className="security-finding"
+                            key={`${finding.rule_id}-${index}`}
+                          >
+                            <div className="security-finding-top">
+                              <span
+                                className={`severity-badge severity-${finding.severity?.toLowerCase()}`}
+                              >
+                                {finding.severity}
+                              </span>
+
+                              <span className="rule-id">
+                                {finding.rule_id}
+                              </span>
+                            </div>
+
+                            <h4>
+                              {finding.category
+                                ?.replaceAll("_", " ")
+                                .replace(/\b\w/g, (letter) =>
+                                  letter.toUpperCase()
+                                )}
+                            </h4>
+
+                            <div className="finding-location">
+                              <strong>{finding.file_path}</strong>
+
+                              <span>
+                                Line {finding.start_line}
+                                {finding.end_line &&
+                                finding.end_line !== finding.start_line
+                                  ? `–${finding.end_line}`
+                                  : ""}
+                              </span>
+                            </div>
+
+                            <p>{finding.message}</p>
+
+                            {finding.evidence && (
+                              <pre className="finding-evidence">
+                                <code>{finding.evidence}</code>
+                              </pre>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="security-empty">
+                        <strong>No security findings detected</strong>
+                        <span>
+                          The scanner did not find any configured security
+                          patterns in this repository.
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="security-analysis-card">
+                    <h3>AI Security Analysis</h3>
+
+                    <p>
+                      Analysis generated by RepoPilot's MCP Security Agent using
+                      repository context and deterministic scanner findings.
+                    </p>
+
+                    <div className="security-analysis-text">
+                      <ReactMarkdown>
+                        {answer.answer || "No security analysis returned."}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="security-empty-state">
+                  <strong>No security scan has been run yet</strong>
+
+                  <p>
+                    Upload and index a repository, then click Run Security Review.
+                  </p>
+                </div>
+              )}
+            </section>
+          )}
 
           <section className="insight-grid">
             <div className="card">
