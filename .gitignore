@@ -43,3 +43,11 @@ docker-data/
 
 # Local test repositories
 sampleproject.zip
+# Local secrets
+APIkey.txt
+
+# Local build artifacts
+buildx/
+
+# Local project documentation
+RepoPilot_AI_Project_Documentation.docx
