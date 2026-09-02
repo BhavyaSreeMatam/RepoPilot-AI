@@ -3,15 +3,22 @@ from dotenv import load_dotenv
 # override=True so backend/.env is the single source of truth even if a stale
 # OPENAI_API_KEY is already present in the OS/shell environment.
 load_dotenv(override=True)
+
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from typing import Any, Dict, List, Optional
+
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.repo_routes import router as repo_router
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
 
 from app.agents.graph import repopilot_graph
-from app.agents.mcp_client import get_mcp_session, close_mcp_session
+from app.agents.mcp_client import (
+    close_mcp_session,
+    get_mcp_session,
+)
+from app.api.repo_routes import router as repo_router
+from app.core.auth import get_current_user_sub
+from app.services.repository_metadata import require_repository_owner
 
 
 @asynccontextmanager
@@ -19,16 +26,23 @@ async def lifespan(app: FastAPI):
     # Spawn the specialized-agents MCP server subprocess once at boot.
     # Fails fast if the subprocess cannot start or initialize.
     await get_mcp_session()
+
     yield
+
     await close_mcp_session()
 
 
 app = FastAPI(
     title="RepoPilot AI",
-    description="An AI Engineering Copilot for Codebase Understanding, Debugging, and Developer Onboarding",
+    description=(
+        "An AI Engineering Copilot for Codebase Understanding, "
+        "Debugging, and Developer Onboarding"
+    ),
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -39,6 +53,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 app.include_router(repo_router)
 
 
@@ -46,18 +62,20 @@ app.include_router(repo_router)
 def root():
     return {
         "message": "RepoPilot AI backend is running",
-        "version": "0.1.0"
+        "version": "0.1.0",
     }
 
 
 @app.get("/health")
 def health_check():
     return {
-        "status": "healthy"
+        "status": "healthy",
     }
+
 
 class AgentSummarizeRequest(BaseModel):
     repo_id: str
+
 
 class AgentAskRequest(BaseModel):
     repo_id: str
@@ -70,6 +88,7 @@ class SourceItem(BaseModel):
     start_line: Optional[int] = None
     end_line: Optional[int] = None
     similarity_distance: Optional[float] = None
+
 
 class SecurityFinding(BaseModel):
     rule_id: str
@@ -88,6 +107,7 @@ class SecurityScanSummary(BaseModel):
     findings_count: int = 0
     severity_counts: Dict[str, int] = {}
 
+
 class AgentAskResponse(BaseModel):
     repo_id: str
     question: str
@@ -100,14 +120,19 @@ class AgentAskResponse(BaseModel):
     security_findings: List[SecurityFinding] = []
     security_scan_summary: Optional[SecurityScanSummary] = None
 
+
 class AgentDebugRequest(BaseModel):
     repo_id: str
     error_message: str
     extra_context: Optional[str] = None
 
-def build_sources_from_contexts(contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+
+def build_sources_from_contexts(
+    contexts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """
-    Converts full retrieved chunks into clean source metadata for API responses.
+    Convert full retrieved chunks into clean source metadata
+    for API responses.
     """
 
     sources = []
@@ -115,21 +140,40 @@ def build_sources_from_contexts(contexts: List[Dict[str, Any]]) -> List[Dict[str
     for item in contexts:
         sources.append(
             {
-                "file_path": item.get("file_path", item.get("source", "unknown")),
+                "file_path": item.get(
+                    "file_path",
+                    item.get("source", "unknown"),
+                ),
                 "language": item.get("language"),
                 "start_line": item.get("start_line"),
                 "end_line": item.get("end_line"),
-                "similarity_distance": item.get("similarity_distance"),
+                "similarity_distance": item.get(
+                    "similarity_distance"
+                ),
             }
         )
 
     return sources
 
-@app.post("/agent/ask", response_model=AgentAskResponse)
-async def agent_ask(request: AgentAskRequest):
+
+@app.post(
+    "/agent/ask",
+    response_model=AgentAskResponse,
+)
+async def agent_ask(
+    request: AgentAskRequest,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
     LangGraph-powered multi-agent ask endpoint.
+
+    The authenticated Cognito user must own the requested repository.
     """
+
+    require_repository_owner(
+        owner_sub=owner_sub,
+        repo_id=request.repo_id,
+    )
 
     initial_state = {
         "repo_id": request.repo_id,
@@ -144,29 +188,61 @@ async def agent_ask(request: AgentAskRequest):
         "steps": [],
     }
 
-    result = await repopilot_graph.ainvoke(initial_state)
+    result = await repopilot_graph.ainvoke(
+        initial_state
+    )
 
-    contexts = result.get("contexts", [])
-    sources = build_sources_from_contexts(contexts)
+    contexts = result.get(
+        "contexts",
+        [],
+    )
+
+    sources = build_sources_from_contexts(
+        contexts
+    )
 
     return {
-            "repo_id": request.repo_id,
-            "question": request.question,
-            "route": result.get("route"),
-            "answer": result.get("answer"),
-            "verified": result.get("verified"),
-            "verifier_notes": result.get("verifier_notes"),
-            "sources": sources,
-            "steps": result.get("steps", []),
-            "security_findings": result.get("security_findings", []),
-            "security_scan_summary": result.get("security_scan_summary"),
-        }
+        "repo_id": request.repo_id,
+        "question": request.question,
+        "route": result.get("route"),
+        "answer": result.get("answer"),
+        "verified": result.get("verified"),
+        "verifier_notes": result.get(
+            "verifier_notes"
+        ),
+        "sources": sources,
+        "steps": result.get(
+            "steps",
+            [],
+        ),
+        "security_findings": result.get(
+            "security_findings",
+            [],
+        ),
+        "security_scan_summary": result.get(
+            "security_scan_summary"
+        ),
+    }
 
-@app.post("/agent/summarize", response_model=AgentAskResponse)
-async def agent_summarize(request: AgentSummarizeRequest):
+
+@app.post(
+    "/agent/summarize",
+    response_model=AgentAskResponse,
+)
+async def agent_summarize(
+    request: AgentSummarizeRequest,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
     Generate a developer onboarding summary for a repository.
+
+    The authenticated Cognito user must own the requested repository.
     """
+
+    require_repository_owner(
+        owner_sub=owner_sub,
+        repo_id=request.repo_id,
+    )
 
     summary_question = """
 Give a developer onboarding summary of this repository.
@@ -197,10 +273,18 @@ Mention relevant file paths.
         "steps": [],
     }
 
-    result = await repopilot_graph.ainvoke(initial_state)
+    result = await repopilot_graph.ainvoke(
+        initial_state
+    )
 
-    contexts = result.get("contexts", [])
-    sources = build_sources_from_contexts(contexts)
+    contexts = result.get(
+        "contexts",
+        [],
+    )
+
+    sources = build_sources_from_contexts(
+        contexts
+    )
 
     return {
         "repo_id": request.repo_id,
@@ -208,18 +292,42 @@ Mention relevant file paths.
         "route": result.get("route"),
         "answer": result.get("answer"),
         "verified": result.get("verified"),
-        "verifier_notes": result.get("verifier_notes"),
+        "verifier_notes": result.get(
+            "verifier_notes"
+        ),
         "sources": sources,
-        "steps": result.get("steps", []),
-        "security_findings": result.get("security_findings", []),
-        "security_scan_summary": result.get("security_scan_summary"),
+        "steps": result.get(
+            "steps",
+            [],
+        ),
+        "security_findings": result.get(
+            "security_findings",
+            [],
+        ),
+        "security_scan_summary": result.get(
+            "security_scan_summary"
+        ),
     }
 
-@app.post("/agent/debug", response_model=AgentAskResponse)
-async def agent_debug(request: AgentDebugRequest):
+
+@app.post(
+    "/agent/debug",
+    response_model=AgentAskResponse,
+)
+async def agent_debug(
+    request: AgentDebugRequest,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
     Diagnose a repository bug/error using the multi-agent pipeline.
+
+    The authenticated Cognito user must own the requested repository.
     """
+
+    require_repository_owner(
+        owner_sub=owner_sub,
+        repo_id=request.repo_id,
+    )
 
     debug_question = f"""
 A developer is debugging this repository.
@@ -255,10 +363,18 @@ Mention relevant file paths and line ranges when possible.
         "steps": [],
     }
 
-    result = await repopilot_graph.ainvoke(initial_state)
+    result = await repopilot_graph.ainvoke(
+        initial_state
+    )
 
-    contexts = result.get("contexts", [])
-    sources = build_sources_from_contexts(contexts)
+    contexts = result.get(
+        "contexts",
+        [],
+    )
+
+    sources = build_sources_from_contexts(
+        contexts
+    )
 
     return {
         "repo_id": request.repo_id,
@@ -266,9 +382,19 @@ Mention relevant file paths and line ranges when possible.
         "route": result.get("route"),
         "answer": result.get("answer"),
         "verified": result.get("verified"),
-        "verifier_notes": result.get("verifier_notes"),
+        "verifier_notes": result.get(
+            "verifier_notes"
+        ),
         "sources": sources,
-        "steps": result.get("steps", []),
-        "security_findings": result.get("security_findings", []),
-        "security_scan_summary": result.get("security_scan_summary"),
+        "steps": result.get(
+            "steps",
+            [],
+        ),
+        "security_findings": result.get(
+            "security_findings",
+            [],
+        ),
+        "security_scan_summary": result.get(
+            "security_scan_summary"
+        ),
     }

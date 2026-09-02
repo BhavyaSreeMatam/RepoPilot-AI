@@ -1,29 +1,48 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
 from pathlib import Path
 import shutil
-import zipfile
 import uuid
-import os
+import zipfile
+import logging
 
-from app.services.repo_scanner import scan_repository
-from app.services.code_chunker import create_code_chunks
-from app.services.vector_service import index_repository, search_repository,delete_repository_index
-from app.services.answer_service import answer_question
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+
+from app.core.auth import get_current_user_sub
 from app.schemas.repo_schemas import AskRepoRequest
+from app.services.answer_service import answer_question
+from app.services.code_chunker import create_code_chunks
+from app.services.repo_scanner import scan_repository
+from app.services.repository_metadata import (
+    create_repository_metadata,
+    delete_repository_metadata,
+    list_user_repositories,
+    mark_repository_indexed,
+    require_repository_owner,
+)
+from app.services.vector_service import (
+    delete_repository_index,
+    index_repository,
+    search_repository,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/repos",
-    tags=["Repositories"]
+    tags=["Repositories"],
 )
+
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 UPLOAD_DIR = BASE_DIR / "uploads"
 EXTRACT_DIR = BASE_DIR / "extracted_repos"
 
+
 def get_uploaded_zip_for_repo(repo_id: str):
     """
-    Finds the uploaded ZIP file for a repo_id.
-    Upload files are stored as: {repo_id}_{original_filename}
+    Find the uploaded ZIP file for a repository.
+
+    Upload files are stored as:
+        {repo_id}_{original_filename}
     """
 
     if not UPLOAD_DIR.exists():
@@ -39,7 +58,7 @@ def get_uploaded_zip_for_repo(repo_id: str):
 
 def get_original_filename(repo_id: str) -> str:
     """
-    Gets the original ZIP filename from the saved upload filename.
+    Get the original ZIP filename from the saved upload filename.
     """
 
     zip_path = get_uploaded_zip_for_repo(repo_id)
@@ -53,174 +72,316 @@ def get_original_filename(repo_id: str) -> str:
 
 def get_repo_root_name(extract_path: Path) -> str:
     """
-    Attempts to find the top-level folder name inside the extracted repository.
+    Attempt to find the top-level folder name inside the extracted repository.
     """
 
     if not extract_path.exists():
         return "unknown"
 
-    children = [item for item in extract_path.iterdir() if item.is_dir()]
+    children = [
+        item
+        for item in extract_path.iterdir()
+        if item.is_dir()
+    ]
 
     if len(children) == 1:
         return children[0].name
 
     return extract_path.name
 
-def safe_extract_zip(zip_path: Path, extract_path: Path):
+
+def cleanup_repository_files(
+    repo_id: str,
+    zip_path: Path | None = None,
+    extract_path: Path | None = None,
+):
+    """
+    Best-effort cleanup used when an upload fails before repository
+    registration is completed.
+    """
+
+    if zip_path is None:
+        zip_path = get_uploaded_zip_for_repo(repo_id)
+
+    if extract_path is None:
+        extract_path = EXTRACT_DIR / repo_id
+
+    if zip_path and zip_path.exists():
+        try:
+            zip_path.unlink()
+        except OSError:
+            pass
+
+    if extract_path.exists():
+        try:
+            shutil.rmtree(extract_path)
+        except OSError:
+            pass
+
+
+def safe_extract_zip(
+    zip_path: Path,
+    extract_path: Path,
+):
     """
     Safely extract ZIP files.
-    Skips files that cannot be extracted instead of crashing the upload.
-    Also prevents path traversal attacks.
+
+    Files that cannot safely be extracted are skipped instead of
+    crashing the upload.
+
+    Path traversal attempts such as ../../file.py are rejected.
     """
 
     skipped_files = []
+
+    resolved_extract_root = extract_path.resolve()
 
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
         for member in zip_ref.infolist():
             member_name = member.filename
 
-            # Skip directories
             if member.is_dir():
                 continue
 
-            # Prevent unsafe paths like ../../file.py
             target_path = extract_path / member_name
             resolved_target = target_path.resolve()
-            resolved_extract_root = extract_path.resolve()
 
-            if not str(resolved_target).startswith(str(resolved_extract_root)):
-                skipped_files.append({
-                    "file": member_name,
-                    "reason": "Unsafe path skipped"
-                })
+            try:
+                resolved_target.relative_to(resolved_extract_root)
+            except ValueError:
+                skipped_files.append(
+                    {
+                        "file": member_name,
+                        "reason": "Unsafe path skipped",
+                    }
+                )
                 continue
 
             try:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
 
                 with zip_ref.open(member) as source_file:
                     with open(target_path, "wb") as target_file:
-                        shutil.copyfileobj(source_file, target_file)
+                        shutil.copyfileobj(
+                            source_file,
+                            target_file,
+                        )
 
             except PermissionError:
-                skipped_files.append({
-                    "file": member_name,
-                    "reason": "Permission denied"
-                })
-                continue
+                skipped_files.append(
+                    {
+                        "file": member_name,
+                        "reason": "Permission denied",
+                    }
+                )
 
-            except OSError as e:
-                skipped_files.append({
-                    "file": member_name,
-                    "reason": str(e)
-                })
-                continue
+            except OSError as exc:
+                skipped_files.append(
+                    {
+                        "file": member_name,
+                        "reason": str(exc),
+                    }
+                )
 
     return skipped_files
 
-@router.post("/upload")
-async def upload_repo(file: UploadFile = File(...)):
+
+def get_owned_repo_path(
+    owner_sub: str,
+    repo_id: str,
+) -> Path:
     """
-    Upload a ZIP file containing a codebase.
-    The backend saves, extracts, and scans the repository.
+    Verify repository ownership before accessing files on disk.
+
+    A repository belonging to another user is intentionally returned
+    as 404 so RepoPilot does not reveal that the repository exists.
     """
 
-    if not file.filename.endswith(".zip"):
+    require_repository_owner(
+        owner_sub=owner_sub,
+        repo_id=repo_id,
+    )
+
+    repo_path = EXTRACT_DIR / repo_id
+
+    if not repo_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Repository not found.",
+        )
+
+    return repo_path
+
+
+@router.post("/upload")
+async def upload_repo(
+    file: UploadFile = File(...),
+    owner_sub: str = Depends(get_current_user_sub),
+):
+    """
+    Upload a ZIP repository and assign ownership to the authenticated
+    Cognito user.
+    """
+
+    original_filename = Path(file.filename or "").name
+
+    if not original_filename.lower().endswith(".zip"):
         raise HTTPException(
             status_code=400,
-            detail="Only .zip files are supported for now."
+            detail="Only .zip files are supported for now.",
         )
 
     repo_id = str(uuid.uuid4())
 
-    UPLOAD_DIR.mkdir(exist_ok=True)
-    EXTRACT_DIR.mkdir(exist_ok=True)
+    UPLOAD_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    EXTRACT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    zip_path = UPLOAD_DIR / f"{repo_id}_{file.filename}"
+    zip_path = UPLOAD_DIR / f"{repo_id}_{original_filename}"
     extract_path = EXTRACT_DIR / repo_id
 
-    with zip_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    skipped_files = []
-
     try:
-        skipped_files = safe_extract_zip(zip_path, extract_path)
+        with zip_path.open("wb") as buffer:
+            shutil.copyfileobj(
+                file.file,
+                buffer,
+            )
+
+        skipped_files = safe_extract_zip(
+            zip_path,
+            extract_path,
+        )
+
+        scan_result = scan_repository(extract_path)
+
+        repo_name = get_repo_root_name(extract_path)
+
+        create_repository_metadata(
+            owner_sub=owner_sub,
+            repo_id=repo_id,
+            repo_name=repo_name,
+            original_filename=original_filename,
+        )
+
     except zipfile.BadZipFile:
+        cleanup_repository_files(
+            repo_id,
+            zip_path,
+            extract_path,
+        )
+
         raise HTTPException(
             status_code=400,
-            detail="Uploaded file is not a valid ZIP file."
+            detail="Uploaded file is not a valid ZIP file.",
         )
-    except Exception as e:
+
+    except HTTPException:
+        cleanup_repository_files(
+            repo_id,
+            zip_path,
+            extract_path,
+        )
+        raise
+
+    except Exception:
+        cleanup_repository_files(
+            repo_id,
+            zip_path,
+            extract_path,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to extract ZIP file: {str(e)}"
+            detail="Failed to process uploaded repository.",
         )
-
-    try:
-        scan_result = scan_repository(extract_path)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to scan repository: {str(e)}"
-        )
-
-
 
     return {
         "message": "Repository uploaded and scanned successfully.",
         "repo_id": repo_id,
-        "original_filename": file.filename,
-        "saved_zip_path": str(zip_path),
-        "extracted_path": str(extract_path),
+        "repo_name": repo_name,
+        "original_filename": original_filename,
         "total_files_found": scan_result["total_files_found"],
         "code_files_found": scan_result["code_files_found"],
         "ignored_files": scan_result["ignored_files"],
         "languages": scan_result["languages"],
         "sample_code_files": scan_result["code_files"][:20],
+        "skipped_extraction_files": skipped_files,
+        "indexed": False,
     }
 
 
 @router.get("")
-def list_repositories():
+def list_repositories(
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    List uploaded/extracted repositories.
+    List only repositories belonging to the authenticated user.
     """
+
+    metadata_items = list_user_repositories(owner_sub)
 
     repositories = []
 
-    if not EXTRACT_DIR.exists():
-        return {
-            "total_repositories": 0,
-            "repositories": []
-        }
+    for metadata in metadata_items:
+        repo_id = metadata["repo_id"]
+        repo_folder = EXTRACT_DIR / repo_id
 
-    for repo_folder in EXTRACT_DIR.iterdir():
-        if not repo_folder.is_dir():
+        # Do not expose stale metadata for repositories whose files
+        # no longer exist on this server.
+        if not repo_folder.exists():
             continue
 
-        repo_id = repo_folder.name
-        zip_path = get_uploaded_zip_for_repo(repo_id)
-
-        repositories.append({
-            "repo_id": repo_id,
-            "repo_name": get_repo_root_name(repo_folder),
-            "original_filename": get_original_filename(repo_id),
-            "extracted_path": str(repo_folder),
-            "uploaded_zip_path": str(zip_path) if zip_path else None,
-            "indexed": True,
-        })
+        repositories.append(
+            {
+                "repo_id": repo_id,
+                "repo_name": metadata.get(
+                    "repo_name",
+                    get_repo_root_name(repo_folder),
+                ),
+                "original_filename": metadata.get(
+                    "original_filename",
+                    get_original_filename(repo_id),
+                ),
+                "indexed": bool(
+                    metadata.get("indexed", False)
+                ),
+                "created_at": metadata.get("created_at"),
+            }
+        )
 
     return {
         "total_repositories": len(repositories),
-        "repositories": repositories
+        "repositories": repositories,
     }
 
+
 @router.delete("/{repo_id}")
-def delete_repository(repo_id: str):
+def delete_repository(
+    repo_id: str,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    Delete an uploaded repository, extracted files, and vector index.
+    Delete a repository owned by the authenticated user.
+
+    Deletes:
+    - uploaded ZIP
+    - extracted repository
+    - vector index
+    - DynamoDB ownership metadata
     """
+
+    require_repository_owner(
+        owner_sub=owner_sub,
+        repo_id=repo_id,
+    )
 
     repo_path = EXTRACT_DIR / repo_id
     zip_path = get_uploaded_zip_for_repo(repo_id)
@@ -231,20 +392,39 @@ def delete_repository(repo_id: str):
     if zip_path and zip_path.exists():
         try:
             zip_path.unlink()
-            deleted_items.append(str(zip_path))
-        except Exception as e:
-            warnings.append(f"Could not delete uploaded ZIP: {str(e)}")
+            deleted_items.append("uploaded_zip")
+        except Exception as exc:
+            warnings.append(
+                f"Could not delete uploaded ZIP: {str(exc)}"
+            )
 
     if repo_path.exists():
         try:
             shutil.rmtree(repo_path)
-            deleted_items.append(str(repo_path))
-        except Exception as e:
-            warnings.append(f"Could not delete extracted repository: {str(e)}")
+            deleted_items.append("extracted_repository")
+        except Exception as exc:
+            warnings.append(
+                f"Could not delete extracted repository: {str(exc)}"
+            )
     else:
-        warnings.append("Extracted repository folder was not found.")
+        warnings.append(
+            "Extracted repository folder was not found."
+        )
 
-    vector_delete_result = delete_repository_index(repo_id)
+    try:
+        vector_delete_result = delete_repository_index(repo_id)
+    except Exception as exc:
+        vector_delete_result = {
+            "deleted": False,
+        }
+        warnings.append(
+            f"Could not delete vector index: {str(exc)}"
+        )
+
+    delete_repository_metadata(
+        owner_sub=owner_sub,
+        repo_id=repo_id,
+    )
 
     return {
         "repo_id": repo_id,
@@ -254,26 +434,27 @@ def delete_repository(repo_id: str):
         "warnings": warnings,
     }
 
+
 @router.get("/{repo_id}/scan")
-def scan_existing_repo(repo_id: str):
+def scan_existing_repo(
+    repo_id: str,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    Scan an already extracted repository by repo_id.
+    Scan an authenticated user's existing repository.
     """
 
-    repo_path = EXTRACT_DIR / repo_id
-
-    if not repo_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found."
-        )
+    repo_path = get_owned_repo_path(
+        owner_sub,
+        repo_id,
+    )
 
     try:
         scan_result = scan_repository(repo_path)
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to scan repository: {str(e)}"
+            detail="Failed to scan repository.",
         )
 
     return {
@@ -287,25 +468,25 @@ def scan_existing_repo(repo_id: str):
 
 
 @router.get("/{repo_id}/chunks")
-def get_repo_chunks(repo_id: str):
+def get_repo_chunks(
+    repo_id: str,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    Create code chunks for an already extracted repository.
+    Create code chunks for an authenticated user's repository.
     """
 
-    repo_path = EXTRACT_DIR / repo_id
-
-    if not repo_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found."
-        )
+    repo_path = get_owned_repo_path(
+        owner_sub,
+        repo_id,
+    )
 
     try:
         chunk_result = create_code_chunks(repo_path)
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create code chunks: {str(e)}"
+            detail="Failed to create code chunks.",
         )
 
     sample_chunks = []
@@ -313,13 +494,15 @@ def get_repo_chunks(repo_id: str):
     for chunk in chunk_result["chunks"][:10]:
         content = chunk["content"]
 
-        sample_chunks.append({
-            "file_path": chunk["file_path"],
-            "language": chunk["language"],
-            "start_line": chunk["start_line"],
-            "end_line": chunk["end_line"],
-            "content_preview": content[:500],
-        })
+        sample_chunks.append(
+            {
+                "file_path": chunk["file_path"],
+                "language": chunk["language"],
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+                "content_preview": content[:500],
+            }
+        )
 
     return {
         "repo_id": repo_id,
@@ -328,75 +511,98 @@ def get_repo_chunks(repo_id: str):
         "sample_chunks": sample_chunks,
     }
 
+
 @router.post("/{repo_id}/index")
-def index_repo(repo_id: str):
+def index_repo(
+    repo_id: str,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    Index repository chunks into the vector database.
+    Index an authenticated user's repository.
     """
 
-    repo_path = EXTRACT_DIR / repo_id
-
-    if not repo_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found."
-        )
+    repo_path = get_owned_repo_path(
+        owner_sub,
+        repo_id,
+    )
 
     try:
-        index_result = index_repository(repo_id, repo_path)
-    except Exception as e:
+        index_result = index_repository(
+            repo_id,
+            repo_path,
+        )
+
+        mark_repository_indexed(
+            owner_sub=owner_sub,
+            repo_id=repo_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Repository indexing failed. repo_id=%s owner_sub=%s",
+            repo_id,
+            owner_sub,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to index repository: {str(e)}"
-        )
+            detail="Failed to index repository.",
+        ) from exc
 
     return index_result
 
 
 @router.get("/{repo_id}/search")
-def search_repo(repo_id: str, query: str, top_k: int = 5):
+def search_repo(
+    repo_id: str,
+    query: str,
+    top_k: int = 5,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    Search indexed repository chunks using natural language.
+    Search an authenticated user's indexed repository.
     """
 
-    repo_path = EXTRACT_DIR / repo_id
-
-    if not repo_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found."
-        )
+    get_owned_repo_path(
+        owner_sub,
+        repo_id,
+    )
 
     if not query.strip():
         raise HTTPException(
             status_code=400,
-            detail="Search query cannot be empty."
+            detail="Search query cannot be empty.",
         )
 
     try:
-        search_result = search_repository(repo_id, query, top_k)
-    except Exception as e:
+        search_result = search_repository(
+            repo_id,
+            query,
+            top_k,
+        )
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to search repository: {str(e)}"
+            detail="Failed to search repository.",
         )
 
     return search_result
 
+
 @router.post("/{repo_id}/ask")
-def ask_repo(repo_id: str, request: AskRepoRequest):
+def ask_repo(
+    repo_id: str,
+    request: AskRepoRequest,
+    owner_sub: str = Depends(get_current_user_sub),
+):
     """
-    Ask a natural language question about an indexed repository.
-    The answer is generated from retrieved code chunks.
+    Ask a question about an authenticated user's indexed repository.
     """
 
-    repo_path = EXTRACT_DIR / repo_id
-
-    if not repo_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found."
-        )
+    get_owned_repo_path(
+        owner_sub,
+        repo_id,
+    )
 
     try:
         answer_result = answer_question(
@@ -404,11 +610,10 @@ def ask_repo(repo_id: str, request: AskRepoRequest):
             question=request.question,
             top_k=request.top_k,
         )
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to answer question: {str(e)}"
+            detail="Failed to answer question.",
         )
 
     return answer_result
-

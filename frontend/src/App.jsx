@@ -1,9 +1,13 @@
-import { uploadRepo, scanRepo, indexRepo, askAgent,generateSummary,debugIssue,securityReview,listRepos,} from "./api";
+import { uploadRepo, scanRepo, indexRepo, askAgent,generateSummary,debugIssue,securityReview,listRepos,deleteRepo,} from "./api";
 import { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import "./App.css";
 
-function App() {
+function App({signOut,user}) {
+    const signedInUser =
+    user?.signInDetails?.loginId ||
+    user?.username ||
+    "Signed in";
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedFileName, setSelectedFileName] = useState("");
 
@@ -61,9 +65,14 @@ useEffect(() => {
 
       const data = await uploadRepo(selectedFile);
 
-
       setUploadResult(data);
       setRepoId(data.repo_id);
+
+      const repositoriesData = await listRepos();
+
+      setRepositories(
+        repositoriesData.repositories || []
+      );
 
       setIndexResult(null);
       setAnswer(null);
@@ -116,6 +125,20 @@ useEffect(() => {
       const data = await indexRepo(repoId);
 
       setIndexResult(data);
+
+
+
+      setRepositories((currentRepositories) =>
+      currentRepositories.map((repository) =>
+        repository.repo_id === repoId
+          ? {
+              ...repository,
+              indexed: true,
+            }
+          : repository
+      )
+    );
+
     } catch (err) {
       console.error("INDEX ERROR:", err);
       setError(err.message || String(err));
@@ -123,6 +146,70 @@ useEffect(() => {
       setLoadingAction("");
       }
     }
+
+
+    async function handleDeleteRepository() {
+  if (!repoId) {
+    setError("Please select a repository first.");
+    return;
+  }
+
+  const selectedRepository =
+    repositories.find(
+      (repository) =>
+        repository.repo_id === repoId
+    );
+
+  const repositoryName =
+    selectedRepository?.repo_name ||
+    selectedRepository?.original_filename ||
+    "this repository";
+
+  const confirmed = window.confirm(
+    `Remove "${repositoryName}"?\n\nThis will permanently delete the uploaded repository and its vector index from RepoPilot.`
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    setLoadingAction("delete");
+    setError("");
+
+    await deleteRepo(repoId);
+
+    setRepositories(
+      (currentRepositories) =>
+        currentRepositories.filter(
+          (repository) =>
+            repository.repo_id !== repoId
+        )
+    );
+
+    setRepoId("");
+    setUploadResult(null);
+    setScanResult(null);
+    setIndexResult(null);
+    setAnswer(null);
+    setQuestion("");
+    setMode("ask");
+    setActiveSection("repositories");
+    setSelectedFile(null);
+    setSelectedFileName("");
+  } catch (err) {
+    console.error(
+      "DELETE REPOSITORY ERROR:",
+      err
+    );
+
+    setError(
+      err.message || String(err)
+    );
+  } finally {
+    setLoadingAction("");
+  }
+}
 
 
   async function handleAsk() {
@@ -335,7 +422,27 @@ useEffect(() => {
               </p>
             </div>
 
-            <div className="status-pill">Backend: Local</div>
+            <div
+              style={{
+                display: "flex",
+                gap: "12px",
+                alignItems: "center",
+                flexWrap: "wrap",
+                justifyContent: "flex-end",
+              }}
+            >
+              <div className="status-pill">
+                Signed in: {signedInUser}
+              </div>
+
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={signOut}
+              >
+                Sign Out
+              </button>
+            </div>
           </header>
 
           {error && (
@@ -491,6 +598,16 @@ useEffect(() => {
                       )}
                     </div>
                   )}
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={handleDeleteRepository}
+                    disabled={loadingAction !== ""}
+                  >
+                    {loadingAction === "delete"
+                      ? "Removing..."
+                      : "Remove Repository"}
+                  </button>
                 </div>
               )}
             </div>

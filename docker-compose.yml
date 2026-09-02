@@ -35,6 +35,8 @@ services:
       context: ./frontend
       args:
         VITE_API_BASE_URL: /api
+        VITE_COGNITO_USER_POOL_ID: us-east-2_AeEdIj97A
+        VITE_COGNITO_USER_POOL_CLIENT_ID: 7gdm7be3sisub11ch2g55i59mg
 
     image: repopilot-frontend
 
