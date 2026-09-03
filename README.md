@@ -1,196 +1,293 @@
 # RepoPilot AI
 
-RepoPilot AI is an AI engineering copilot for understanding, debugging, and onboarding into unfamiliar codebases.
+RepoPilot AI is a full-stack AI engineering copilot for understanding, onboarding into, debugging, and reviewing unfamiliar codebases. Users authenticate, upload a repository ZIP, index the codebase, and interact with specialized AI agents that return source-grounded answers.
 
-The system allows users to upload a repository as a ZIP file, index the codebase, and ask natural-language engineering questions. It uses retrieval-augmented generation and a multi-agent workflow to route questions to specialized agents for architecture explanation, onboarding summaries, bug diagnosis, and grounded answer verification.
+## What RepoPilot Does
 
-## Features
+- Authenticated sign-in/sign-up with Amazon Cognito
+- Per-user repository isolation with Amazon DynamoDB ownership metadata
+- Repository ZIP upload, safe extraction, scanning, deletion, and persistent storage
+- Batched OpenAI embeddings for faster indexing
+- ChromaDB vector search for repository-aware retrieval
+- LangGraph orchestration with router, retriever, specialized-agent, and verifier stages
+- MCP server with specialized architecture, bug, security, documentation, and general agents
+- Onboarding summaries, architecture Q&A, debugging assistance, and security review
+- Source file references and line ranges in answers
+- Dockerized frontend and backend
+- AWS EC2 + ECR deployment
+- Automatic deployment from GitHub `master` through AWS CodeBuild and SSM
+- GitHub Actions CI for frontend and backend checks
 
-- Upload a repository ZIP file from the frontend
-- Automatically scan and process code files
-- Chunk and index repository content for retrieval
-- Ask architecture and codebase questions
-- Generate developer onboarding summaries
-- Debug repository-specific issues
-- Retrieve source file references and line ranges
-- Show agent execution steps
-- Verify answers against retrieved code context
+## Final Architecture
 
-## Tech Stack
+```mermaid
+flowchart LR
+    U[User Browser] -->|Sign in / Sign up| COG[Amazon Cognito]
+    U -->|Bearer token + requests| FE[React / Vite Frontend\nNginx]
 
-### Backend
-- FastAPI
-- Python
-- OpenAI API
-- Local vector store (ChromaDB)
-- LangGraph multi-agent workflow for routing, retrieval, answering, debugging, summarization, and verification
-- MCP (Model Context Protocol) — the orchestrator communicates with the specialized agents as MCP tools over stdio
+    FE -->|/api| API[FastAPI Backend]
+    API --> AUTH[Cognito JWT Verification]
+    AUTH --> OWN[DynamoDB Repository Ownership]
 
-### Frontend
-- React
-- Vite
-- JavaScript
-- React Markdown
-- Custom CSS dashboard UI
+    API --> FILES[Uploaded ZIP + Extracted Repositories]
+    API --> IDX[Code Scanner + Chunker]
+    IDX --> EMB[OpenAI Embeddings\nBatched]
+    EMB --> CHROMA[ChromaDB Vector Store]
 
-## Project Structure
+    API --> GRAPH[LangGraph Orchestrator]
+    GRAPH --> ROUTER[Router]
+    ROUTER --> RET[Retriever]
+    RET --> CHROMA
+    RET --> MCP[MCP Specialized-Agent Server]
+    MCP --> ARCH[Architecture Agent]
+    MCP --> BUG[Bug Agent]
+    MCP --> SEC[Security Agent]
+    MCP --> DOC[Docs Agent]
+    MCP --> GEN[General Agent]
+    MCP --> OAI[OpenAI Chat Models]
+    GRAPH --> VERIFY[Verifier]
+    VERIFY --> OAI
+    VERIFY --> API
+```
 
-```txt
+## AWS Deployment Architecture
+
+```mermaid
+flowchart TB
+    GH[GitHub Repository\nmaster branch] --> CI[GitHub Actions CI\nFrontend lint/build\nBackend compile/smoke]
+    GH -->|Push webhook| CB[AWS CodeBuild\nRepoPilot-Deploy]
+    CB -->|Build + push| ECRB[Amazon ECR\nrepopilot-backend]
+    CB -->|Build + push| ECRF[Amazon ECR\nrepopilot-frontend]
+    CB -->|AWS Systems Manager| EC2[Amazon EC2]
+    EC2 -->|Pull latest images| ECRB
+    EC2 -->|Pull latest images| ECRF
+    EC2 --> NGINX[Nginx Frontend\nPort 80]
+    NGINX --> FASTAPI[FastAPI Backend\nDocker network]
+    FASTAPI --> DDB[DynamoDB\nRepoPilotRepositories]
+    FASTAPI --> COG[Amazon Cognito]
+    FASTAPI --> OPENAI[OpenAI API]
+```
+
+## Repository Structure
+
+```text
 RepoPilot-AI/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── backend/
 │   ├── app/
 │   │   ├── agents/
 │   │   ├── api/
 │   │   ├── core/
+│   │   ├── mcp_server/
 │   │   ├── schemas/
 │   │   └── services/
+│   ├── Dockerfile
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx
-│   │   ├── App.css
-│   │   └── api.js
-│   ├── package.json
-│   └── vite.config.js
+│   ├── Dockerfile
+│   └── package.json
+├── buildspec.deploy.yml
+├── docker-compose.yml
 └── README.md
 ```
 
-## Architecture
+## Local Prerequisites
 
-The orchestrator (router) communicates with the five specialized agents through **MCP (Model Context Protocol)**. The router, retriever, and verifier run as in-process LangGraph nodes; the specialized agents run in a separate MCP server subprocess and are invoked as MCP tools over stdio. The subprocess is spawned once at FastAPI startup (via the `lifespan` handler) and reused across requests.
+- Python 3.14
+- Node.js 22+
+- npm
+- Docker Desktop (optional for local container testing)
+- AWS CLI with the `repopilot` profile if using the deployed DynamoDB/Cognito resources locally
+- OpenAI API key
 
-```mermaid
-flowchart TB
-    subgraph Client["Frontend (React / Vite)"]
-        UI["Dashboard UI<br/>api.js"]
-    end
+## Environment Variables
 
-    subgraph Backend["FastAPI Backend Process"]
-        direction TB
-        EP["/agent/ask · /agent/summarize · /agent/debug<br/>(async → ainvoke)"]
-
-        subgraph Graph["LangGraph StateGraph (in-process)"]
-            direction TB
-            R["router_agent<br/>picks route via LLM"]
-            RET["retriever_agent<br/>ChromaDB vector search"]
-            SPEC["specialized_agent_node<br/>ROUTE_TO_TOOL lookup<br/>+ MCP call_tool"]
-            VER["verifier_agent<br/>grounding check"]
-            R --> RET --> SPEC --> VER
-        end
-
-        MC["mcp_client.py<br/>persistent ClientSession<br/>(AsyncExitStack, stdio)"]
-
-        EP --> R
-        VER --> EP
-        SPEC -->|"await session.call_tool()"| MC
-    end
-
-    subgraph MCPServer["MCP Server Subprocess (stdio)"]
-        direction TB
-        FM["FastMCP<br/>'repopilot-specialized-agents'"]
-        subgraph Tools["@mcp.tool()"]
-            T1["architecture_agent"]
-            T2["bug_agent"]
-            T3["security_agent"]
-            T4["docs_agent"]
-            T5["general_agent"]
-        end
-        FM --> Tools
-        LLM["run_llm_agent()<br/>llm_utils.py"]
-        Tools --> LLM
-    end
-
-    OpenAI["OpenAI API<br/>gpt-4.1-mini"]
-
-    UI -->|HTTP| EP
-    MC <==>|"MCP over stdio<br/>(spawned at lifespan startup,<br/>env=os.environ.copy())"| FM
-    R -.->|LLM call| OpenAI
-    VER -.->|LLM call| OpenAI
-    LLM -->|LLM call| OpenAI
-    RET -.->|embeddings| OpenAI
-```
-
-## Setup Instructions
-
-### Backend Setup
-
-```powershell
-cd backend
-python -m venv venv
-.\venv\scripts\activate.ps1
-pip install -r requirements.txt
-```
-
-Create a `.env` file inside the `backend/` folder:
+Create `backend/.env` from `.env.example`. Do not commit `.env`.
 
 ```env
-OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_API_KEY=your_openai_api_key
+DATABASE_URL=postgresql://username:password@localhost:5432/repopilot
+ENVIRONMENT=development
+AWS_REGION=us-east-2
+COGNITO_USER_POOL_ID=your_cognito_user_pool_id
+COGNITO_APP_CLIENT_ID=your_cognito_app_client_id
+REPOSITORY_TABLE_NAME=RepoPilotRepositories
 ```
 
-Run the backend:
+For the frontend, create `frontend/.env.local`:
+
+```env
+VITE_AWS_REGION=us-east-2
+VITE_COGNITO_USER_POOL_ID=your_cognito_user_pool_id
+VITE_COGNITO_USER_POOL_CLIENT_ID=your_cognito_app_client_id
+```
+
+## Run Locally
+
+### Backend
 
 ```powershell
-uvicorn app.main:app
+cd D:\Projects\RepoPilot-AI\backend
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install "botocore[crt]"
+
+$env:AWS_PROFILE = "repopilot"
+$env:AWS_REGION = "us-east-2"
+
+uvicorn app.main:app --reload --reload-dir app
 ```
 
-The backend will run at:
-
-```txt
-http://127.0.0.1:8000
-```
-
-API documentation is available at:
-
-```txt
-http://127.0.0.1:8000/docs
-```
-
-### Frontend Setup
-
-Open a new terminal:
+Backend health:
 
 ```powershell
-cd frontend
-npm install
+curl.exe http://127.0.0.1:8000/health
+```
+
+### Frontend
+
+```powershell
+cd D:\Projects\RepoPilot-AI\frontend
+npm ci
 npm run dev
 ```
 
-The frontend will run at:
+Open `http://localhost:5173`.
 
-```txt
-http://localhost:5173
+> Use `--reload-dir app` for the backend. Plain `--reload` can watch uploaded/extracted repositories and restart Uvicorn during uploads.
+
+## Main API Routes
+
+| Route | Purpose |
+|---|---|
+| `GET /health` | Public backend health check |
+| `POST /repos/upload` | Upload and extract a repository ZIP |
+| `GET /repos` | List repositories owned by the signed-in user |
+| `DELETE /repos/{repo_id}` | Delete owned repository data and vector index |
+| `GET /repos/{repo_id}/scan` | Scan repository structure/languages |
+| `GET /repos/{repo_id}/chunks` | Inspect generated chunks |
+| `POST /repos/{repo_id}/index` | Build repository embeddings/vector index |
+| `GET /repos/{repo_id}/search` | Search indexed repository chunks |
+| `POST /agent/ask` | Ask architecture/general/security questions |
+| `POST /agent/summarize` | Generate onboarding summary |
+| `POST /agent/debug` | Debug a repository-specific issue |
+
+All repository and agent routes except `/health` require a valid Cognito access token and repository ownership.
+
+## Application Flow
+
+1. User authenticates with Cognito.
+2. Frontend obtains a Cognito access token.
+3. Every protected API request sends `Authorization: Bearer <access token>`.
+4. Backend verifies the JWT issuer, signature, expiry, token type, app client, and user `sub`.
+5. User uploads a ZIP; FastAPI safely extracts and scans it.
+6. Repository ownership metadata is stored in DynamoDB using `owner_sub + repo_id`.
+7. User indexes the repository; code is chunked and embeddings are generated in batches.
+8. Chunks and embeddings are persisted in ChromaDB.
+9. Agent requests verify ownership, retrieve relevant chunks, route through LangGraph/MCP agents, and run verifier grounding.
+10. The frontend displays the answer, sources, execution steps, and verification information.
+11. Deleting a repository removes its uploaded/extracted files, vector index, and DynamoDB metadata.
+
+## CI/CD
+
+### GitHub Actions
+
+`.github/workflows/ci.yml` runs on pushes and pull requests and performs:
+
+- Frontend `npm ci`, lint, and production build
+- Backend dependency installation, compile check, and import smoke test
+
+### AWS CodeBuild Deployment
+
+`buildspec.deploy.yml` is used by the `RepoPilot-Deploy` CodeBuild project. A push to `master` triggers CodeBuild through a GitHub webhook.
+
+CodeBuild:
+
+1. Logs in to ECR.
+2. Creates a short commit image tag.
+3. Builds backend and frontend Docker images.
+4. Pushes versioned and `latest` tags to ECR.
+5. Sends an SSM command to the RepoPilot EC2 instance.
+6. EC2 pulls the latest images and recreates the containers.
+7. Deployment waits for backend health and verifies frontend/backend through Nginx.
+
+Normal deployment workflow:
+
+```powershell
+git add .
+git commit -m "Describe the change"
+git push origin master
 ```
 
-## Usage Flow
+## AWS Resource Inventory
 
-1. Start the backend server.
-2. Start the frontend development server.
-3. Upload a repository ZIP file.
-4. Index the uploaded repository.
-5. Ask architecture or codebase questions.
-6. Generate onboarding summaries.
-7. Use the debug assistant for repository-specific issues.
-8. Review retrieved sources, agent steps, and verifier notes.
+| Service | RepoPilot Resource |
+|---|---|
+| EC2 | RepoPilot application host |
+| ECR | `repopilot-backend` |
+| ECR | `repopilot-frontend` |
+| IAM | `RepoPilotEC2Role` |
+| IAM | `RepoPilotCodeBuildRole` |
+| Cognito | `RepoPilotUsers` user pool |
+| Cognito | `RepoPilotWebClient` app client |
+| DynamoDB | `RepoPilotRepositories` |
+| SSM Parameter Store | `/repopilot/openai-api-key` |
+| CodeBuild | `RepoPilot-Deploy` |
+| CodeConnections | `RepoPilotGitHubConnection` |
+| GitHub Actions | `.github/workflows/ci.yml` |
+| CodeBuild buildspec | `buildspec.deploy.yml` |
 
-## Screenshots
+## Security Design
 
-### Repository Dashboard
+- OpenAI API key is not committed to Git.
+- Production OpenAI key is stored in AWS SSM Parameter Store.
+- EC2 uses an IAM instance role instead of static AWS credentials.
+- CodeBuild uses its own least-privilege IAM role.
+- GitHub is connected to AWS through a GitHub App/CodeConnections rather than long-lived AWS keys.
+- Repository access is scoped by Cognito `sub` and DynamoDB ownership metadata.
+- Unauthorized repository lookups return `404` to avoid leaking repository existence.
+- ZIP extraction validates target paths to reduce path traversal risk.
+- Security scanning checks patterns such as unsafe deserialization, secrets, command execution, insecure configuration, cryptographic weaknesses, Docker/CI/CD risks, and unsafe file handling.
 
-![Repository Dashboard](docs/screenshots/Homepage.png)
+## Important Current Limitation
 
-### Indexed Repository
+The portfolio deployment currently uses the EC2 public IPv4 address over **HTTP**. Authentication works, but the demo should not be treated as production-grade until HTTPS is added. Avoid uploading sensitive/private repositories to the public demo.
 
-![Indexed Repository](docs/screenshots/Indexed.png)
+## Troubleshooting
 
-### Agent Answer
+### Local DynamoDB error with AWS login credentials
 
-![Agent Answer](docs/screenshots/Agent_answer.png)
+If boto3 reports that the login credential provider requires an additional dependency:
 
-### Sources and Agent Steps
+```powershell
+pip install "botocore[crt]"
+```
 
-![Sources and Verifier](docs/screenshots/Sources&agentsteps.png)
+### Upload causes Uvicorn to restart
 
-### Verifier 
+Start the backend with:
 
-![Debug Assistant](docs/screenshots/verifier.png)
+```powershell
+uvicorn app.main:app --reload --reload-dir app
+```
+
+### Indexing is slow or times out
+
+RepoPilot batches embedding requests instead of making one OpenAI call per chunk. The current implementation uses batches of 32.
+
+### Indexed badge does not update
+
+The frontend updates repository state immediately after a successful indexing request. Reloading should not be required.
+
+### Agent endpoints return no visible answer
+
+Check the browser Network response and backend logs. A `200 OK` from `/agent/ask` plus a valid JSON answer usually indicates a frontend rendering/state problem rather than an OpenAI/MCP failure.
+
+## Portfolio Summary
+
+RepoPilot AI demonstrates full-stack and AI engineering across RAG, vector retrieval, LangGraph orchestration, MCP agents, deterministic security scanning, authentication and authorization, AWS deployment, Docker, persistent storage, and automated CI/CD.
