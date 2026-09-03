@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [master]
 
-# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -15,15 +14,17 @@ jobs:
   frontend:
     name: Frontend (lint + build)
     runs-on: ubuntu-latest
+
     defaults:
       run:
         working-directory: frontend
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -37,11 +38,22 @@ jobs:
         run: npm run build
 
   backend:
-    name: Backend (install + smoke)
+    name: Backend (compile + smoke)
     runs-on: ubuntu-latest
+
     defaults:
       run:
         working-directory: backend
+
+    env:
+      OPENAI_API_KEY: test-key
+      DATABASE_URL: postgresql://username:password@localhost:5432/repopilot
+      ENVIRONMENT: test
+      AWS_REGION: us-east-2
+      COGNITO_USER_POOL_ID: us-east-2_TestPool
+      COGNITO_APP_CLIENT_ID: test-client
+      REPOSITORY_TABLE_NAME: RepoPilotRepositories
+
     steps:
       - uses: actions/checkout@v4
 
@@ -60,47 +72,5 @@ jobs:
         run: python -m compileall app
 
       - name: Import smoke test
-        # Importing the app wires the LangGraph graph, the MCP client params, and
-        # the FastMCP server module. None of these need OPENAI_API_KEY at import
-        # time (clients are constructed lazily), so no secret is required here.
-        run: python -c "import app.main; import app.mcp_server.server; print('import OK')"
-
-  docker:
-    name: Build & publish backend image
-    runs-on: ubuntu-latest
-    needs: backend
-    # Only publish from master pushes — never from PRs (fork PRs can't push, and
-    # we don't want to publish unreviewed images).
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Derive image metadata (tags + labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=long
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ./backend
-          file: ./backend/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          python -c "import app.main; import app.mcp_server.server; print('RepoPilot backend import OK')"
